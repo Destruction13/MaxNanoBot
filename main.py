@@ -30,6 +30,7 @@ from api_client import (
     ApiError,
     ChatMessage,
     ChatResponse,
+    encode_image_bytes,
     encode_image_from_path,
 )
 from config import Settings, load_settings
@@ -58,20 +59,28 @@ MAX_CONVERSATION_MESSAGES = 30  # Keep last N messages in context
 MAX_TEXT_RESPONSE_LENGTH = 4000  # Telegram message limit
 
 # System instruction for the AI assistant
-AI_SYSTEM_INSTRUCTION = """You are a helpful, friendly AI assistant in a Telegram bot. You can:
+AI_SYSTEM_INSTRUCTION = """You are a helpful, friendly AI assistant in a Telegram bot with image generation capabilities.
+
+CAPABILITIES:
 1. Answer questions on any topic
-2. Generate images when asked (the API supports image generation)
+2. Generate images when asked
 3. Analyze and describe images sent by the user
 4. Edit or modify images based on user requests
-5. Remember conversation context
+5. Remember full conversation context including generated images
 
-Guidelines:
+IMAGE EDITING RULES (CRITICAL):
+- When user asks to modify a previously generated image (e.g. "make it pink", "add a hat", "change background"), you MUST use the exact same image from context and apply ONLY the requested changes
+- Preserve ALL aspects of the original image: composition, style, lighting, perspective, characters, objects - change ONLY what the user specifically asked to change
+- If user says "make HER pink" or "add a hat to IT", refer to the last generated image and modify that exact image
+- Keep the same art style, color palette (except requested changes), proportions, and overall aesthetic
+- Do NOT regenerate the image from scratch - edit the existing one
+
+GENERAL GUIDELINES:
 - Be concise but helpful
-- Use emoji occasionally to be friendly
-- When generating images, describe what you're creating
-- If the user asks to modify a previous image, reference it from context
+- Use emoji occasionally to be friendly 😊
 - Respond in the same language the user writes in
-- If asked to generate/create/draw an image, do it directly
+- When generating NEW images, briefly describe what you're creating
+- When EDITING images, just confirm what you changed
 """
 RETRY_BUTTON_TEXT = "🔁 Попробовать ещё"
 RETRY_CALLBACK_DATA = "retry_last"
@@ -635,17 +644,21 @@ def create_router(
                     await bot.send_message(chat_id, chunk, parse_mode=None)
             
             # Send images if any
+            response_image_data: list[dict] = []
             for i, image_bytes in enumerate(response.images):
                 await bot.send_photo(
                     chat_id,
                     BufferedInputFile(image_bytes, filename=f"image_{i+1}.png"),
                 )
+                # Store image in context for future reference (limited to avoid huge history)
+                if len(response_image_data) < 2:  # Keep max 2 images in context
+                    response_image_data.append(encode_image_bytes(image_bytes))
             
-            # Save model response to conversation (text only, no images to avoid thought_signature issues)
+            # Save model response to conversation
             model_msg = ConversationMessage(
                 role="model",
-                text=response.text if response.text else "[Сгенерировано изображение]",
-                image_data=[],  # Don't store generated images - Gemini requires thought_signature for them
+                text=response.text if response.text else "",
+                image_data=response_image_data,
             )
             await storage.add_to_conversation(user_id, model_msg, max_messages=MAX_CONVERSATION_MESSAGES)
             
