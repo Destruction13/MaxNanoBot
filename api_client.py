@@ -102,6 +102,13 @@ class ApiClient:
         # Extract full image parts (with thought_signature) for context
         image_parts = _extract_image_parts(data)
         
+        # Debug: log if thought_signature is present
+        import logging
+        for i, part in enumerate(image_parts):
+            inline = part.get("inline_data", {})
+            has_sig = "thought_signature" in inline
+            logging.info(f"Image part {i}: has thought_signature={has_sig}, keys={list(inline.keys())}")
+        
         # Decode images for sending to user
         images: list[bytes] = []
         for part in image_parts:
