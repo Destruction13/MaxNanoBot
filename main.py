@@ -58,28 +58,27 @@ MAX_CONVERSATION_MESSAGES = 30  # Keep last N messages in context
 MAX_TEXT_RESPONSE_LENGTH = 4000  # Telegram message limit
 
 # System instruction for the AI assistant
-AI_SYSTEM_INSTRUCTION = """You are a helpful, friendly AI assistant in a Telegram bot with image generation capabilities.
+AI_SYSTEM_INSTRUCTION = """Ты — дружелюбный AI-ассистент в Telegram-боте с возможностью генерации и редактирования изображений.
 
-CAPABILITIES:
-1. Answer questions on any topic
-2. Generate images when asked
-3. Analyze and describe images sent by the user
-4. Edit or modify images based on user requests
-5. Remember full conversation context including generated images
+ВОЗМОЖНОСТИ:
+1. Отвечать на вопросы на любые темы
+2. Генерировать изображения по описанию
+3. Анализировать присланные пользователем изображения
+4. Редактировать изображения по запросу
 
-IMAGE EDITING RULES (CRITICAL):
-- When user asks to modify a previously generated image (e.g. "make it pink", "add a hat", "change background"), you MUST use the exact same image from context and apply ONLY the requested changes
-- Preserve ALL aspects of the original image: composition, style, lighting, perspective, characters, objects - change ONLY what the user specifically asked to change
-- If user says "make HER pink" or "add a hat to IT", refer to the last generated image and modify that exact image
-- Keep the same art style, color palette (except requested changes), proportions, and overall aesthetic
-- Do NOT regenerate the image from scratch - edit the existing one
+ПРАВИЛА РЕДАКТИРОВАНИЯ ИЗОБРАЖЕНИЙ (КРИТИЧЕСКИ ВАЖНО):
+- Когда пользователь просит изменить предыдущее изображение ("сделай розовым", "добавь шляпу", "измени фон") — ты получаешь это изображение автоматически
+- Сохраняй ВСЕ аспекты оригинального изображения: композицию, стиль, освещение, перспективу, персонажей, объекты
+- Меняй ТОЛЬКО то, что пользователь конкретно попросил изменить
+- Сохраняй тот же художественный стиль, цветовую палитру (кроме запрошенных изменений), пропорции и общую эстетику
+- НЕ генерируй изображение заново с нуля — редактируй существующее
 
-GENERAL GUIDELINES:
-- Be concise but helpful
-- Use emoji occasionally to be friendly 😊
-- Respond in the same language the user writes in
-- When generating NEW images, briefly describe what you're creating
-- When EDITING images, just confirm what you changed
+ОБЩИЕ ПРАВИЛА:
+- Отвечай кратко, но полезно
+- Используй эмодзи для дружелюбности 😊
+- Отвечай на том же языке, на котором пишет пользователь
+- При генерации НОВОГО изображения — кратко опиши, что создаёшь
+- При РЕДАКТИРОВАНИИ — подтверди, что именно изменил
 """
 RETRY_BUTTON_TEXT = "🔁 Попробовать ещё"
 RETRY_CALLBACK_DATA = "retry_last"
@@ -445,13 +444,20 @@ def _split_long_message(text: str, max_length: int = MAX_TEXT_RESPONSE_LENGTH) -
 def _conversation_to_chat_messages(
     messages: list[ConversationMessage],
 ) -> list[ChatMessage]:
-    """Convert stored conversation to API format."""
+    """Convert stored conversation to API format (text only, no images)."""
     result: list[ChatMessage] = []
     for msg in messages:
+        # Add note about image if it was present
+        text = msg.text
+        if msg.has_image and msg.role == "user":
+            text = f"{text} [пользователь прислал изображение]" if text else "[пользователь прислал изображение]"
+        elif msg.has_image and msg.role == "model":
+            text = f"{text} [было сгенерировано изображение]" if text else "[было сгенерировано изображение]"
+        
         result.append(ChatMessage(
             role=msg.role,
-            text=msg.text,
-            image_data=msg.image_data,
+            text=text,
+            image_data=[],  # No images in history - they're fetched fresh
         ))
     return result
 
@@ -607,23 +613,46 @@ def create_router(
         Returns True on success, False on failure.
         """
         try:
-            # Get conversation history
+            # Get conversation history (text only)
             history = await storage.get_conversation(user_id, max_messages=MAX_CONVERSATION_MESSAGES)
             
-            # Create user message and add to history
+            # Check if we need to include last generated image in context
+            # (when user asks to modify it, e.g., "make it pink", "add a hat")
+            context_image_data: list[dict] = []
+            if not user_image_data:
+                # No user image - check if there's a last generated image to include
+                last_gen_file_id = await storage.get_last_generated_image(user_id)
+                if last_gen_file_id:
+                    try:
+                        path = await _download_photo(
+                            bot,
+                            last_gen_file_id,
+                            temp_dir=settings.temp_dir,
+                            user_id=user_id,
+                            index=999,
+                        )
+                        context_image_data.append(await encode_image_from_path(path))
+                        await _cleanup_paths([path], temp_dir=settings.temp_dir, user_id=user_id)
+                    except Exception as exc:
+                        logging.warning("Failed to load last generated image: %s", exc)
+            
+            # Combine user images with context images
+            all_image_data = user_image_data if user_image_data else context_image_data
+            
+            # Create user message and add to history (text only, flag for image)
             user_msg = ConversationMessage(
                 role="user",
                 text=user_text,
-                image_data=user_image_data,
+                has_image=bool(user_image_data),
             )
             await storage.add_to_conversation(user_id, user_msg, max_messages=MAX_CONVERSATION_MESSAGES)
             
-            # Build messages for API
+            # Build messages for API - history (text only) + current message (with images)
             chat_messages = _conversation_to_chat_messages(history)
             chat_messages.append(ChatMessage(
                 role="user",
                 text=user_text,
-                image_data=user_image_data,
+                image_data=all_image_data,
             ))
             
             # Call AI API
@@ -642,21 +671,26 @@ def create_router(
                 for chunk in chunks:
                     await bot.send_message(chat_id, chunk, parse_mode=None)
             
-            # Send images if any
+            # Send images and save last one for context
+            last_sent_file_id: str | None = None
             for i, image_bytes in enumerate(response.images):
-                await bot.send_photo(
+                sent_msg = await bot.send_photo(
                     chat_id,
                     BufferedInputFile(image_bytes, filename=f"image_{i+1}.png"),
                 )
+                # Get file_id of sent photo for future context
+                if sent_msg.photo:
+                    last_sent_file_id = sent_msg.photo[-1].file_id
             
-            # Save model response to conversation with full image_parts (includes thought_signature)
-            # Limit to 2 images to avoid huge history
-            response_image_parts = response.image_parts[:2] if response.image_parts else []
+            # Save last generated image file_id for future context
+            if last_sent_file_id:
+                await storage.set_last_generated_image(user_id, last_sent_file_id)
             
+            # Save model response to conversation (text only, flag for image)
             model_msg = ConversationMessage(
                 role="model",
                 text=response.text if response.text else "",
-                image_data=response_image_parts,
+                has_image=bool(response.images),
             )
             await storage.add_to_conversation(user_id, model_msg, max_messages=MAX_CONVERSATION_MESSAGES)
             

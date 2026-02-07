@@ -24,14 +24,14 @@ class ConversationMessage:
     """A single message in conversation history."""
     role: str  # "user" or "model"
     text: str
-    image_data: list[dict[str, Any]] = field(default_factory=list)
+    has_image: bool = False  # Flag indicating image was present (not stored inline)
     timestamp: float = field(default_factory=time.time)
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "role": self.role,
             "text": self.text,
-            "image_data": self.image_data,
+            "has_image": self.has_image,
             "timestamp": self.timestamp,
         }
 
@@ -40,7 +40,7 @@ class ConversationMessage:
         return cls(
             role=data.get("role", "user"),
             text=data.get("text", ""),
-            image_data=data.get("image_data", []),
+            has_image=data.get("has_image", False),
             timestamp=data.get("timestamp", 0.0),
         )
 
@@ -115,6 +115,15 @@ class Storage:
             CREATE TABLE IF NOT EXISTS conversation_history (
                 user_id INTEGER PRIMARY KEY,
                 messages TEXT NOT NULL,
+                updated_at REAL NOT NULL
+            )
+            """
+        )
+        await self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS last_generated_image (
+                user_id INTEGER PRIMARY KEY,
+                file_id TEXT NOT NULL,
                 updated_at REAL NOT NULL
             )
             """
@@ -477,38 +486,48 @@ class Storage:
             "DELETE FROM conversation_history WHERE user_id = ?",
             (user_id,),
         )
+        await self._conn.execute(
+            "DELETE FROM last_generated_image WHERE user_id = ?",
+            (user_id,),
+        )
         await self._conn.commit()
 
-    async def update_last_model_response(
-        self, user_id: int, image_data: list[dict]
-    ) -> None:
-        """Update the last model message with generated image data (for context)."""
+    # ========== Last Generated Image ==========
+
+    async def set_last_generated_image(self, user_id: int, file_id: str) -> None:
+        """Store the file_id of the last generated image for context."""
         if self._conn is None:
             raise RuntimeError("Storage is not connected")
-        
-        messages = await self.get_conversation(user_id, max_messages=100)
-        if not messages:
-            return
-        
-        # Find the last model message and update it
-        for i in range(len(messages) - 1, -1, -1):
-            if messages[i].role == "model":
-                messages[i].image_data = image_data
-                break
-        else:
-            return  # No model message found
-        
-        # Save back
-        payload = json.dumps([msg.to_dict() for msg in messages])
         updated_at = time.time()
         await self._conn.execute(
             """
-            INSERT INTO conversation_history (user_id, messages, updated_at)
+            INSERT INTO last_generated_image (user_id, file_id, updated_at)
             VALUES (?, ?, ?)
             ON CONFLICT(user_id) DO UPDATE SET
-                messages = excluded.messages,
+                file_id = excluded.file_id,
                 updated_at = excluded.updated_at
             """,
-            (user_id, payload, updated_at),
+            (user_id, file_id, updated_at),
+        )
+        await self._conn.commit()
+
+    async def get_last_generated_image(self, user_id: int) -> str | None:
+        """Get the file_id of the last generated image."""
+        if self._conn is None:
+            raise RuntimeError("Storage is not connected")
+        async with self._conn.execute(
+            "SELECT file_id FROM last_generated_image WHERE user_id = ?",
+            (user_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return row[0] if row else None
+
+    async def clear_last_generated_image(self, user_id: int) -> None:
+        """Clear the last generated image."""
+        if self._conn is None:
+            raise RuntimeError("Storage is not connected")
+        await self._conn.execute(
+            "DELETE FROM last_generated_image WHERE user_id = ?",
+            (user_id,),
         )
         await self._conn.commit()
