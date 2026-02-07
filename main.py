@@ -10,8 +10,10 @@ from typing import Iterable
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.filters import Command, CommandStart
+from aiogram.dispatcher.event.bases import SkipHandler
+from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     BotCommand,
@@ -23,21 +25,208 @@ from aiogram.types import (
 )
 from aiogram.types.input_file import BufferedInputFile
 
-from api_client import ApiClient, ApiError
+from api_client import (
+    ApiClient,
+    ApiError,
+    ChatMessage,
+    ChatResponse,
+    encode_image_bytes,
+    encode_image_from_path,
+)
 from config import Settings, load_settings
 from models import ModelInfo, ModelRegistry, fetch_models, filter_image_models
-from storage import Storage
+from storage import Storage, ConversationMessage
 
 MEDIA_GROUP_DELAY = 0.6
 INSTRUCTION_MESSAGE = (
-    "Ок, модель выбрана. Теперь пришли одним сообщением промпт "
-    "(и опционально фото)."
+    "Ок, модель выбрана! Теперь можешь общаться со мной как с ChatGPT.\n\n"
+    "Я могу:\n"
+    "• Отвечать на вопросы\n"
+    "• Генерировать и редактировать изображения\n"
+    "• Анализировать фото\n"
+    "• Помнить контекст диалога\n\n"
+    "Команды: /clear — очистить историю, /swap — сменить модель"
 )
-NEED_PROMPT_MESSAGE = "Нужен промпт текстом"
-PENDING_PHOTOS_MESSAGE = "Ок, фото принял. Теперь пришли промпт текстом."
-PENDING_PHOTOS_WAIT_MESSAGE = "Ок, фото принял. Сейчас генерирую, промпт после."
-WAIT_MESSAGE = "Сейчас генерирую предыдущий запрос. Подожди и пришли ещё раз."
+NEED_PROMPT_MESSAGE = "Напиши что-нибудь 😊"
+PENDING_PHOTOS_MESSAGE = "Ок, фото принял. Что сделать с ним?"
+PENDING_PHOTOS_WAIT_MESSAGE = "Ок, фото принял. Сейчас обрабатываю, подожди."
+WAIT_MESSAGE = "Сейчас обрабатываю предыдущий запрос. Подожди и пришли ещё раз."
+THINKING_MESSAGE = "Думаю..."
 GENERATING_MESSAGE = "Генерирую..."
+ERROR_MESSAGE = "Что-то пошло не так 😕"
+CONVERSATION_CLEARED_MESSAGE = "✨ История диалога очищена. Начинаем с чистого листа!"
+MAX_CONVERSATION_MESSAGES = 30  # Keep last N messages in context
+MAX_TEXT_RESPONSE_LENGTH = 4000  # Telegram message limit
+
+# System instruction for the AI assistant
+AI_SYSTEM_INSTRUCTION = """You are a helpful, friendly AI assistant in a Telegram bot. You can:
+1. Answer questions on any topic
+2. Generate images when asked (the API supports image generation)
+3. Analyze and describe images sent by the user
+4. Edit or modify images based on user requests
+5. Remember conversation context
+
+Guidelines:
+- Be concise but helpful
+- Use emoji occasionally to be friendly
+- When generating images, describe what you're creating
+- If the user asks to modify a previous image, reference it from context
+- Respond in the same language the user writes in
+- If asked to generate/create/draw an image, do it directly
+"""
+RETRY_BUTTON_TEXT = "🔁 Попробовать ещё"
+RETRY_CALLBACK_DATA = "retry_last"
+COPY_BUTTON_TEXT = "📋 Скопировать"
+COPY_CALLBACK_DATA = "copy_prompt"
+EDIT_BUTTON_TEXT = "✏️ Отредактировать и повторить"
+EDIT_CALLBACK_DATA = "edit_prompt"
+STYLE_CALLBACK_PREFIX = "style:"
+RETRY_BUSY_MESSAGE = "Генерация уже идёт"
+NO_LAST_REQUEST_MESSAGE = "Нет сохранённого запроса для повтора."
+PROMPT_PREFIX = "🧠 Prompt: "
+STYLE_PROMPT_MESSAGE = "Выбери стиль генерации:"
+EDIT_PROMPT_MESSAGE = "Пришли новый текст промпта.\nМодель и стиль оставлю прежними."
+FINAL_MESSAGE_TEMPLATE = "🎨 Стиль: {style_name}\n\n🧠 Prompt:\n{prompt}"
+COUNT_PROMPT_MESSAGE = "Сколько вариантов сгенерировать? Выбери 1-4."
+VARIANTS_MIN = 1
+VARIANTS_MAX = 4
+MAX_IN_FLIGHT = 2
+CAPTION_PROMPT_LIMIT = 900
+VARIANT_HINTS = (
+    "мягче свет",
+    "чуть больше контраста",
+    "чуть теплее",
+    "более кинематографично",
+)
+
+
+@dataclass(frozen=True, slots=True)
+class StyleDefinition:
+    id: str
+    title: str
+    system_prompt: str | None
+
+
+CINEMATIC_REALISM_PROMPT = (
+    "You are generating a highly cinematic, photorealistic image.\n"
+    "Visual style inspired by high-end cinema photography and modern film grading.\n\n"
+    "Key characteristics:\n"
+    "- realistic human proportions and anatomy\n"
+    "- natural skin texture, pores, imperfections\n"
+    "- cinematic lighting (soft key light, subtle rim light, controlled shadows)\n"
+    "- shallow depth of field where appropriate\n"
+    "- professional color grading (film-like contrast, rich but natural tones)\n"
+    "- dramatic but realistic atmosphere\n"
+    "- no cartoonish or stylized exaggerations\n\n"
+    "The result should look like a frame from a high-budget movie, shot on a professional cinema camera."
+)
+HYPERREALISM_PROMPT = (
+    "You are generating an ultra-detailed hyperrealistic image.\n\n"
+    "Key characteristics:\n"
+    "- extreme level of detail and sharpness\n"
+    "- highly realistic textures (skin, fabric, materials)\n"
+    "- accurate lighting with physically plausible reflections\n"
+    "- realistic imperfections and micro-details\n"
+    "- high-resolution photographic look\n"
+    "- no stylization, no illustration, no painterly effects\n\n"
+    "The image should look more realistic than a photograph, as if captured with perfect lighting and optics."
+)
+DIGITAL_ILLUSTRATION_PROMPT = (
+    "You are generating a high-quality digital illustration.\n\n"
+    "Key characteristics:\n"
+    "- clearly illustrated, non-photorealistic style\n"
+    "- painterly or clean digital brush strokes\n"
+    "- intentional stylization of shapes and forms\n"
+    "- expressive lighting and color composition\n"
+    "- artistic interpretation over realism\n"
+    "- smooth gradients or textured strokes depending on composition\n\n"
+    "The image should look like a premium digital artwork created by a professional concept artist."
+)
+CARTOON_PROMPT = (
+    "You are generating a cartoon-style image.\n\n"
+    "Key characteristics:\n"
+    "- stylized proportions and simplified anatomy\n"
+    "- clean shapes and readable silhouettes\n"
+    "- expressive facial features and emotions\n"
+    "- bold, clear colors\n"
+    "- smooth or cel-shaded rendering\n"
+    "- playful or animated look\n\n"
+    "The image should look like a high-quality animated cartoon or modern animated film frame, not photorealistic."
+)
+DARK_MYTHOLOGY_PROMPT = (
+    "You are generating a dark, epic, mythological image.\n\n"
+    "Key characteristics:\n"
+    "- monumental and powerful composition\n"
+    "- dark fantasy atmosphere\n"
+    "- dramatic, high-contrast lighting\n"
+    "- deep shadows, volumetric fog, smoke or mist\n"
+    "- mythological, god-like or legendary presence\n"
+    "- epic scale and emotional intensity\n\n"
+    "The image should feel ancient, powerful, and cinematic, like dark mythological concept art or epic fantasy illustration."
+)
+SCI_FI_PROMPT = (
+    "You are generating a futuristic science fiction image.\n\n"
+    "Key characteristics:\n"
+    "- advanced technology and futuristic design\n"
+    "- neon accents, holograms, or high-tech materials\n"
+    "- clean but complex shapes\n"
+    "- controlled artificial lighting\n"
+    "- cyberpunk or sci-fi atmosphere (depending on prompt)\n"
+    "- sense of technological advancement\n\n"
+    "The image should look like high-end sci-fi concept art or a frame from a futuristic movie."
+)
+MINIMAL_ART_PROMPT = (
+    "You are generating a minimalistic artistic image.\n\n"
+    "Key characteristics:\n"
+    "- simple, clean composition\n"
+    "- strong focus on subject\n"
+    "- limited color palette\n"
+    "- intentional use of negative space\n"
+    "- artistic framing and balance\n"
+    "- calm, aesthetic mood\n\n"
+    "The image should feel like modern art photography or gallery-level visual art."
+)
+
+STYLE_NONE = StyleDefinition(id="none", title="🧼 Без стиля", system_prompt=None)
+STYLES: tuple[StyleDefinition, ...] = (
+    STYLE_NONE,
+    StyleDefinition(
+        id="cinematic_realism",
+        title="🎬 Кинематографичный реализм",
+        system_prompt=CINEMATIC_REALISM_PROMPT,
+    ),
+    StyleDefinition(
+        id="hyperrealism",
+        title="📸 Гиперреализм",
+        system_prompt=HYPERREALISM_PROMPT,
+    ),
+    StyleDefinition(
+        id="digital_illustration",
+        title="🎨 Иллюстрация / Digital Art",
+        system_prompt=DIGITAL_ILLUSTRATION_PROMPT,
+    ),
+    StyleDefinition(
+        id="cartoon",
+        title="🧸 Мультфильм",
+        system_prompt=CARTOON_PROMPT,
+    ),
+    StyleDefinition(
+        id="dark_mythology",
+        title="🗿 Тёмная мифология",
+        system_prompt=DARK_MYTHOLOGY_PROMPT,
+    ),
+    StyleDefinition(
+        id="sci_fi",
+        title="🤖 Футуризм / Sci-Fi",
+        system_prompt=SCI_FI_PROMPT,
+    ),
+    StyleDefinition(
+        id="minimal_art",
+        title="🖼 Минимализм / Арт-фото",
+        system_prompt=MINIMAL_ART_PROMPT,
+    ),
+)
+STYLE_BY_ID = {style.id: style for style in STYLES}
 
 
 @dataclass(slots=True)
@@ -55,6 +244,10 @@ class MediaGroupBucket:
     bot: Bot
     state: FSMContext
     snapshots: list[MessageSnapshot]
+
+
+class EditPromptState(StatesGroup):
+    waiting = State()
 
 
 def _ensure_dir(path: Path) -> None:
@@ -99,6 +292,67 @@ async def _delete_aux_messages(
         await storage.clear_aux_messages(user_id)
 
 
+def _get_style(style_id: str | None) -> StyleDefinition:
+    if not style_id:
+        return STYLE_NONE
+    return STYLE_BY_ID.get(style_id, STYLE_NONE)
+
+
+def _build_style_keyboard(selected_style_id: str | None) -> InlineKeyboardMarkup:
+    selected_style = _get_style(selected_style_id)
+    rows: list[list[InlineKeyboardButton]] = []
+    for style in STYLES:
+        label = style.title
+        if style.id == selected_style.id:
+            label = f"✅ {label}"
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=label,
+                    callback_data=f"{STYLE_CALLBACK_PREFIX}{style.id}",
+                )
+            ]
+        )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _build_final_prompt(user_prompt: str, style_id: str) -> str:
+    style = _get_style(style_id)
+    if style.system_prompt is None:
+        return user_prompt
+    return f"{style.system_prompt}\n\nUSER PROMPT:\n{user_prompt}"
+
+
+def _format_final_message(style_id: str, prompt: str) -> str:
+    style = _get_style(style_id)
+    return FINAL_MESSAGE_TEMPLATE.format(style_name=style.title, prompt=prompt)
+
+
+def _build_final_actions_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=RETRY_BUTTON_TEXT,
+                    callback_data=RETRY_CALLBACK_DATA,
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text=COPY_BUTTON_TEXT,
+                    callback_data=COPY_CALLBACK_DATA,
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text=EDIT_BUTTON_TEXT,
+                    callback_data=EDIT_CALLBACK_DATA,
+                )
+            ],
+        ]
+    )
+
+
 def _build_models_keyboard(
     models: Iterable[ModelInfo],
     selected_model: str | None,
@@ -117,10 +371,82 @@ def _build_models_keyboard(
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def _normalize_variants_count(value: int) -> int:
+    try:
+        count = int(value)
+    except (TypeError, ValueError):
+        return VARIANTS_MIN
+    return min(VARIANTS_MAX, max(VARIANTS_MIN, count))
+
+
+def _build_variants_keyboard(selected: int) -> InlineKeyboardMarkup:
+    selected = _normalize_variants_count(selected)
+    row: list[InlineKeyboardButton] = []
+    for count in range(VARIANTS_MIN, VARIANTS_MAX + 1):
+        label = f"✅ {count}" if count == selected else str(count)
+        row.append(
+            InlineKeyboardButton(
+                text=label,
+                callback_data=f"count:{count}",
+            )
+        )
+    return InlineKeyboardMarkup(inline_keyboard=[row])
+
+
+def _build_variant_prompt(base_prompt: str, variant_index: int) -> str:
+    hint = VARIANT_HINTS[(variant_index - 1) % len(VARIANT_HINTS)]
+    return f"{base_prompt}\n\nВариант {variant_index}: {hint}"
+
+
+def _format_partial_failure(failed: int, total: int) -> str:
+    verb = "не получился" if failed == 1 else "не получилось"
+    return f"{failed} из {total} {verb}"
+
+
 def _get_user_lock(locks: dict[int, asyncio.Lock], user_id: int) -> asyncio.Lock:
     if user_id not in locks:
         locks[user_id] = asyncio.Lock()
     return locks[user_id]
+
+
+def _split_long_message(text: str, max_length: int = MAX_TEXT_RESPONSE_LENGTH) -> list[str]:
+    """Split long message into chunks for Telegram."""
+    if len(text) <= max_length:
+        return [text]
+    
+    chunks: list[str] = []
+    current = ""
+    
+    for line in text.split("\n"):
+        if len(current) + len(line) + 1 <= max_length:
+            current = f"{current}\n{line}" if current else line
+        else:
+            if current:
+                chunks.append(current)
+            # If single line is too long, split it
+            while len(line) > max_length:
+                chunks.append(line[:max_length])
+                line = line[max_length:]
+            current = line
+    
+    if current:
+        chunks.append(current)
+    
+    return chunks if chunks else [""]
+
+
+def _conversation_to_chat_messages(
+    messages: list[ConversationMessage],
+) -> list[ChatMessage]:
+    """Convert stored conversation to API format."""
+    result: list[ChatMessage] = []
+    for msg in messages:
+        result.append(ChatMessage(
+            role=msg.role,
+            text=msg.text,
+            image_data=msg.image_data,
+        ))
+    return result
 
 
 def _snapshot_message(message: Message) -> MessageSnapshot:
@@ -179,6 +505,32 @@ async def _cleanup_paths(paths: Iterable[str], *, temp_dir: Path, user_id: int) 
             user_dir.rmdir()
 
 
+async def _send_generation_results(
+    bot: Bot,
+    chat_id: int,
+    images: list[bytes],
+    prompt: str,
+    style_id: str,
+) -> None:
+    if len(images) == 1:
+        await bot.send_photo(
+            chat_id,
+            BufferedInputFile(images[0], filename="result.png"),
+        )
+    else:
+        for index, image in enumerate(images, start=1):
+            await bot.send_photo(
+                chat_id,
+                BufferedInputFile(image, filename=f"result_{index}.png"),
+            )
+    await bot.send_message(
+        chat_id,
+        _format_final_message(style_id, prompt),
+        reply_markup=_build_final_actions_keyboard(),
+        parse_mode=None,
+    )
+
+
 async def _prompt_model_selection(
     bot: Bot,
     chat_id: int,
@@ -218,6 +570,245 @@ def create_router(
         if not lock.locked():
             await _delete_aux_messages(bot, storage, user_id)
 
+    async def _send_error(
+        bot: Bot,
+        chat_id: int,
+        user_id: int,
+        message: str = ERROR_MESSAGE,
+    ) -> None:
+        error_message = await _send_aux(
+            bot,
+            storage,
+            user_id,
+            chat_id,
+            message,
+        )
+        keep = {(error_message.chat.id, error_message.message_id)}
+        await _delete_aux_messages(bot, storage, user_id, keep=keep)
+
+    async def _run_ai_chat(
+        *,
+        bot: Bot,
+        chat_id: int,
+        user_id: int,
+        model_id: str,
+        user_text: str,
+        user_image_data: list[dict],
+    ) -> bool:
+        """
+        Main AI chat function - handles conversation with context.
+        Returns True on success, False on failure.
+        """
+        try:
+            # Get conversation history
+            history = await storage.get_conversation(user_id, max_messages=MAX_CONVERSATION_MESSAGES)
+            
+            # Create user message and add to history
+            user_msg = ConversationMessage(
+                role="user",
+                text=user_text,
+                image_data=user_image_data,
+            )
+            await storage.add_to_conversation(user_id, user_msg, max_messages=MAX_CONVERSATION_MESSAGES)
+            
+            # Build messages for API
+            chat_messages = _conversation_to_chat_messages(history)
+            chat_messages.append(ChatMessage(
+                role="user",
+                text=user_text,
+                image_data=user_image_data,
+            ))
+            
+            # Call AI API
+            response: ChatResponse = await api_client.chat(
+                model_id,
+                chat_messages,
+                system_instruction=AI_SYSTEM_INSTRUCTION,
+            )
+            
+            # Process response
+            await _delete_aux_messages(bot, storage, user_id)
+            
+            # Send text response
+            if response.text:
+                chunks = _split_long_message(response.text)
+                for chunk in chunks:
+                    await bot.send_message(chat_id, chunk, parse_mode=None)
+            
+            # Send images if any
+            response_image_data: list[dict] = []
+            for i, image_bytes in enumerate(response.images):
+                await bot.send_photo(
+                    chat_id,
+                    BufferedInputFile(image_bytes, filename=f"image_{i+1}.png"),
+                )
+                # Store image in context for future reference (limited to avoid huge history)
+                if len(response_image_data) < 2:  # Keep max 2 images in context
+                    response_image_data.append(encode_image_bytes(image_bytes))
+            
+            # Save model response to conversation
+            model_msg = ConversationMessage(
+                role="model",
+                text=response.text,
+                image_data=response_image_data,
+            )
+            await storage.add_to_conversation(user_id, model_msg, max_messages=MAX_CONVERSATION_MESSAGES)
+            
+            return True
+            
+        except ApiError as exc:
+            logging.exception("AI chat failed: %s", exc)
+            await _send_error(bot, chat_id, user_id, f"{ERROR_MESSAGE}\n\n{exc}")
+            return False
+        except Exception as exc:
+            logging.exception("Unexpected AI chat error: %s", exc)
+            await _send_error(bot, chat_id, user_id)
+            return False
+
+    # Keep legacy function for backwards compatibility with retry
+    async def _send_generation_error(
+        bot: Bot,
+        chat_id: int,
+        user_id: int,
+    ) -> None:
+        await _send_error(bot, chat_id, user_id)
+
+    async def _send_partial_failure_notice(
+        bot: Bot,
+        chat_id: int,
+        user_id: int,
+        *,
+        failed: int,
+        total: int,
+    ) -> None:
+        message = _format_partial_failure(failed, total)
+        error_message = await _send_aux(
+            bot,
+            storage,
+            user_id,
+            chat_id,
+            message,
+        )
+        keep = {(error_message.chat.id, error_message.message_id)}
+        await _delete_aux_messages(bot, storage, user_id, keep=keep)
+
+    async def _run_generation(
+        *,
+        bot: Bot,
+        chat_id: int,
+        user_id: int,
+        model_id: str,
+        prompt: str,
+        style_id: str,
+        photo_file_ids: list[str],
+        variants_count: int,
+    ) -> bool:
+        paths: list[str] = []
+        try:
+            for index, file_id in enumerate(photo_file_ids, start=1):
+                path = await _download_photo(
+                    bot,
+                    file_id,
+                    temp_dir=settings.temp_dir,
+                    user_id=user_id,
+                    index=index,
+                )
+                paths.append(path)
+            if variants_count <= 1:
+                image = await api_client.generate_image(
+                    model_id,
+                    paths,
+                    prompt,
+                )
+                await _send_generation_results(bot, chat_id, [image], prompt, style_id)
+                await _delete_aux_messages(bot, storage, user_id)
+                return True
+
+            semaphore = asyncio.Semaphore(MAX_IN_FLIGHT)
+
+            async def _generate_variant(index: int) -> tuple[int, bytes | None, Exception | None]:
+                variant_prompt = _build_variant_prompt(prompt, index)
+                try:
+                    async with semaphore:
+                        image = await api_client.generate_image(
+                            model_id,
+                            paths,
+                            variant_prompt,
+                        )
+                    return index, image, None
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    return index, None, exc
+
+            tasks = [
+                asyncio.create_task(_generate_variant(index))
+                for index in range(1, variants_count + 1)
+            ]
+            success_count = 0
+            failure_count = 0
+            for task in asyncio.as_completed(tasks):
+                try:
+                    index, image, error = await task
+                except Exception as exc:
+                    logging.exception("Unexpected generation error: %s", exc)
+                    failure_count += 1
+                    continue
+                if error is not None:
+                    if isinstance(error, ApiError):
+                        logging.exception(
+                            "Generation failed for variant %s: %s",
+                            index,
+                            error,
+                        )
+                    else:
+                        logging.exception(
+                            "Unexpected generation error for variant %s: %s",
+                            index,
+                            error,
+                        )
+                    failure_count += 1
+                    continue
+                if image is None:
+                    failure_count += 1
+                    continue
+                success_count += 1
+                await bot.send_photo(
+                    chat_id,
+                    BufferedInputFile(image, filename=f"result_{index}.png"),
+                )
+
+            if success_count:
+                await bot.send_message(
+                    chat_id,
+                    _format_final_message(style_id, prompt),
+                    reply_markup=_build_final_actions_keyboard(),
+                    parse_mode=None,
+                )
+                if failure_count:
+                    await _send_partial_failure_notice(
+                        bot,
+                        chat_id,
+                        user_id,
+                        failed=failure_count,
+                        total=variants_count,
+                    )
+                else:
+                    await _delete_aux_messages(bot, storage, user_id)
+                return True
+
+            await _send_generation_error(bot, chat_id, user_id)
+            return False
+        except ApiError as exc:
+            logging.exception("Generation failed: %s", exc)
+            await _send_generation_error(bot, chat_id, user_id)
+        except Exception as exc:
+            logging.exception("Unexpected generation error: %s", exc)
+            await _send_generation_error(bot, chat_id, user_id)
+        finally:
+            await _cleanup_paths(paths, temp_dir=settings.temp_dir, user_id=user_id)
+        return False
+
     async def _process_snapshots(
         snapshots: list[MessageSnapshot],
         *,
@@ -226,12 +817,14 @@ def create_router(
         user_id: int,
         state: FSMContext,
     ) -> None:
+        """Process user message(s) through AI chat with context."""
         ordered = sorted(snapshots, key=lambda item: item.message_id)
         prompt = _extract_prompt(ordered)
         prompt_present = bool(prompt and prompt.strip())
         photo_ids = _extract_photo_ids(ordered)
         lock = _get_user_lock(locks, user_id)
 
+        # If only photos without text, store them and ask what to do
         if not prompt_present:
             if photo_ids:
                 if not lock.locked():
@@ -261,6 +854,7 @@ def create_router(
                 )
             return
 
+        # Check if already processing
         if lock.locked():
             await _send_aux(
                 bot,
@@ -273,6 +867,7 @@ def create_router(
 
         await _delete_aux_messages(bot, storage, user_id)
 
+        # Check if model is selected
         selected_model = await storage.get_selected_model(user_id)
         if not selected_model or not registry.get(selected_model):
             await _prompt_model_selection(
@@ -287,6 +882,7 @@ def create_router(
             )
             return
 
+        # Try to acquire lock
         try:
             await asyncio.wait_for(lock.acquire(), timeout=0.01)
         except asyncio.TimeoutError:
@@ -299,6 +895,7 @@ def create_router(
             )
             return
 
+        # Collect images (from message or pending)
         pending_used = False
         if photo_ids:
             await storage.clear_pending_images(user_id)
@@ -311,61 +908,51 @@ def create_router(
             else:
                 active_photo_ids = []
 
-        await _send_aux(
-            bot,
-            storage,
-            user_id,
-            chat_id,
-            GENERATING_MESSAGE,
-        )
-        paths: list[str] = []
         success = False
         try:
+            # Show thinking indicator
+            await _send_aux(
+                bot,
+                storage,
+                user_id,
+                chat_id,
+                THINKING_MESSAGE,
+            )
+            
+            # Download and encode images for API
+            user_image_data: list[dict] = []
+            paths_to_cleanup: list[str] = []
+            
             for index, file_id in enumerate(active_photo_ids, start=1):
-                path = await _download_photo(
-                    bot,
-                    file_id,
-                    temp_dir=settings.temp_dir,
-                    user_id=user_id,
-                    index=index,
-                )
-                paths.append(path)
-            image_bytes = await api_client.generate_image(
-                selected_model,
-                paths,
-                prompt,
+                try:
+                    path = await _download_photo(
+                        bot,
+                        file_id,
+                        temp_dir=settings.temp_dir,
+                        user_id=user_id,
+                        index=index,
+                    )
+                    paths_to_cleanup.append(path)
+                    image_data = await encode_image_from_path(path)
+                    user_image_data.append(image_data)
+                except Exception as exc:
+                    logging.warning("Failed to download photo %s: %s", file_id, exc)
+            
+            # Run AI chat
+            success = await _run_ai_chat(
+                bot=bot,
+                chat_id=chat_id,
+                user_id=user_id,
+                model_id=selected_model,
+                user_text=prompt,
+                user_image_data=user_image_data,
             )
-            success = True
-            await bot.send_photo(
-                chat_id,
-                BufferedInputFile(image_bytes, filename="result.png"),
-            )
-            await _delete_aux_messages(bot, storage, user_id)
-        except ApiError as exc:
-            logging.exception("Generation failed: %s", exc)
-            error_message = await _send_aux(
-                bot,
-                storage,
-                user_id,
-                chat_id,
-                "Ошибка генерации",
-            )
-            keep = {(error_message.chat.id, error_message.message_id)}
-            await _delete_aux_messages(bot, storage, user_id, keep=keep)
-        except Exception as exc:
-            logging.exception("Unexpected generation error: %s", exc)
-            error_message = await _send_aux(
-                bot,
-                storage,
-                user_id,
-                chat_id,
-                "Ошибка генерации",
-            )
-            keep = {(error_message.chat.id, error_message.message_id)}
-            await _delete_aux_messages(bot, storage, user_id, keep=keep)
+            
+            # Cleanup downloaded files
+            await _cleanup_paths(paths_to_cleanup, temp_dir=settings.temp_dir, user_id=user_id)
+            
         finally:
             lock.release()
-            await _cleanup_paths(paths, temp_dir=settings.temp_dir, user_id=user_id)
             if pending_used and success:
                 await storage.clear_pending_images(user_id)
 
@@ -385,7 +972,6 @@ def create_router(
     @router.message(CommandStart())
     async def handle_start(message: Message, state: FSMContext) -> None:
         user_id = message.from_user.id if message.from_user else 0
-        await _safe_delete(message.bot, message.chat.id, message.message_id)
         await _clear_aux_if_idle(message.bot, user_id)
         await _prompt_model_selection(
             message.bot,
@@ -401,7 +987,6 @@ def create_router(
     @router.message(Command("swap"))
     async def handle_swap(message: Message, state: FSMContext) -> None:
         user_id = message.from_user.id if message.from_user else 0
-        await _safe_delete(message.bot, message.chat.id, message.message_id)
         await _clear_aux_if_idle(message.bot, user_id)
         await _prompt_model_selection(
             message.bot,
@@ -413,6 +998,44 @@ def create_router(
             settings,
             greeting=False,
         )
+
+    @router.message(Command("count"))
+    async def handle_count(message: Message) -> None:
+        user_id = message.from_user.id if message.from_user else 0
+        await _clear_aux_if_idle(message.bot, user_id)
+        selected = _normalize_variants_count(
+            await storage.get_variants_count(user_id)
+        )
+        await _send_aux(
+            message.bot,
+            storage,
+            user_id,
+            message.chat.id,
+            COUNT_PROMPT_MESSAGE,
+            reply_markup=_build_variants_keyboard(selected),
+        )
+
+    @router.message(Command("style"))
+    async def handle_style(message: Message) -> None:
+        user_id = message.from_user.id if message.from_user else 0
+        await _clear_aux_if_idle(message.bot, user_id)
+        selected_style = await storage.get_selected_style(user_id)
+        await _send_aux(
+            message.bot,
+            storage,
+            user_id,
+            message.chat.id,
+            STYLE_PROMPT_MESSAGE,
+            reply_markup=_build_style_keyboard(selected_style),
+        )
+
+    @router.message(Command("clear"))
+    async def handle_clear(message: Message) -> None:
+        """Clear conversation history."""
+        user_id = message.from_user.id if message.from_user else 0
+        await _clear_aux_if_idle(message.bot, user_id)
+        await storage.clear_conversation(user_id)
+        await message.answer(CONVERSATION_CLEARED_MESSAGE)
 
     @router.callback_query(F.data.startswith("model:"))
     async def handle_model_select(callback: CallbackQuery, state: FSMContext) -> None:
@@ -436,11 +1059,198 @@ def create_router(
             INSTRUCTION_MESSAGE,
         )
 
-    @router.message(~F.text.startswith("/"))
+    @router.callback_query(F.data.startswith("count:"))
+    async def handle_count_select(callback: CallbackQuery) -> None:
+        user_id = callback.from_user.id if callback.from_user else 0
+        raw = callback.data.split(":", 1)[1]
+        try:
+            selected = _normalize_variants_count(int(raw))
+        except ValueError:
+            await callback.answer("Некорректное значение", show_alert=True)
+            return
+        await storage.set_variants_count(user_id, selected)
+        await callback.answer(f"Буду генерировать {selected}")
+        if callback.message:
+            await _safe_delete(
+                callback.message.bot,
+                callback.message.chat.id,
+                callback.message.message_id,
+            )
+
+    @router.callback_query(F.data.startswith(STYLE_CALLBACK_PREFIX))
+    async def handle_style_select(callback: CallbackQuery) -> None:
+        user_id = callback.from_user.id if callback.from_user else 0
+        style_id = callback.data.split(":", 1)[1]
+        style = _get_style(style_id)
+        if style.id != style_id:
+            await callback.answer("Неизвестный стиль", show_alert=True)
+            return
+        await storage.set_selected_style(user_id, style.id)
+        await callback.answer(f"Стиль: {style.title}")
+        if callback.message:
+            await callback.message.edit_reply_markup(
+                reply_markup=_build_style_keyboard(style.id)
+            )
+
+    @router.callback_query(F.data == RETRY_CALLBACK_DATA)
+    async def handle_retry(callback: CallbackQuery) -> None:
+        user_id = callback.from_user.id if callback.from_user else 0
+        lock = _get_user_lock(locks, user_id)
+        if lock.locked():
+            await callback.answer(RETRY_BUSY_MESSAGE, show_alert=True)
+            return
+
+        last_request = await storage.get_last_request(user_id)
+        if not last_request:
+            await callback.answer(NO_LAST_REQUEST_MESSAGE, show_alert=True)
+            return
+
+        try:
+            await asyncio.wait_for(lock.acquire(), timeout=0.01)
+        except asyncio.TimeoutError:
+            await callback.answer(RETRY_BUSY_MESSAGE, show_alert=True)
+            return
+
+        await callback.answer()
+        chat_id = callback.message.chat.id if callback.message else callback.from_user.id
+        await _delete_aux_messages(callback.bot, storage, user_id)
+
+        try:
+            style = _get_style(last_request.style_id)
+            final_prompt = _build_final_prompt(last_request.prompt, style.id)
+            await _send_aux(
+                callback.bot,
+                storage,
+                user_id,
+                chat_id,
+                GENERATING_MESSAGE,
+            )
+            await _run_generation(
+                bot=callback.bot,
+                chat_id=chat_id,
+                user_id=user_id,
+                model_id=last_request.model_id,
+                prompt=final_prompt,
+                style_id=style.id,
+                photo_file_ids=last_request.photo_file_ids,
+                variants_count=1,
+            )
+        finally:
+            lock.release()
+
+    @router.callback_query(F.data == COPY_CALLBACK_DATA)
+    async def handle_copy_prompt(callback: CallbackQuery) -> None:
+        user_id = callback.from_user.id if callback.from_user else 0
+        last_request = await storage.get_last_request(user_id)
+        if not last_request:
+            await callback.answer(NO_LAST_REQUEST_MESSAGE, show_alert=True)
+            return
+        style = _get_style(last_request.style_id)
+        final_prompt = _build_final_prompt(last_request.prompt, style.id)
+        await callback.answer()
+        chat_id = callback.message.chat.id if callback.message else callback.from_user.id
+        await callback.bot.send_message(chat_id, final_prompt, parse_mode=None)
+
+    @router.callback_query(F.data == EDIT_CALLBACK_DATA)
+    async def handle_edit_prompt(callback: CallbackQuery, state: FSMContext) -> None:
+        user_id = callback.from_user.id if callback.from_user else 0
+        last_request = await storage.get_last_request(user_id)
+        if not last_request:
+            await callback.answer(NO_LAST_REQUEST_MESSAGE, show_alert=True)
+            return
+        await callback.answer()
+        chat_id = callback.message.chat.id if callback.message else callback.from_user.id
+        await callback.bot.send_message(chat_id, EDIT_PROMPT_MESSAGE)
+        await state.set_state(EditPromptState.waiting)
+
+    @router.message(StateFilter(EditPromptState.waiting))
+    async def handle_edit_message(message: Message, state: FSMContext) -> None:
+        if message.text and message.text.startswith("/"):
+            raise SkipHandler()
+        user_id = message.from_user.id if message.from_user else 0
+        prompt = message.text or message.caption or ""
+        if not prompt.strip():
+            await _send_aux(
+                message.bot,
+                storage,
+                user_id,
+                message.chat.id,
+                NEED_PROMPT_MESSAGE,
+            )
+            return
+        last_request = await storage.get_last_request(user_id)
+        if not last_request:
+            await state.clear()
+            await _send_aux(
+                message.bot,
+                storage,
+                user_id,
+                message.chat.id,
+                NO_LAST_REQUEST_MESSAGE,
+            )
+            return
+
+        lock = _get_user_lock(locks, user_id)
+        if lock.locked():
+            await _send_aux(
+                message.bot,
+                storage,
+                user_id,
+                message.chat.id,
+                WAIT_MESSAGE,
+            )
+            return
+
+        try:
+            await asyncio.wait_for(lock.acquire(), timeout=0.01)
+        except asyncio.TimeoutError:
+            await _send_aux(
+                message.bot,
+                storage,
+                user_id,
+                message.chat.id,
+                WAIT_MESSAGE,
+            )
+            return
+
+        await state.clear()
+        await _delete_aux_messages(message.bot, storage, user_id)
+
+        style = _get_style(last_request.style_id)
+        final_prompt = _build_final_prompt(prompt, style.id)
+        try:
+            await _send_aux(
+                message.bot,
+                storage,
+                user_id,
+                message.chat.id,
+                GENERATING_MESSAGE,
+            )
+            await storage.set_last_request(
+                user_id,
+                last_request.model_id,
+                prompt,
+                style.id,
+                last_request.photo_file_ids,
+                last_request.variants_count,
+            )
+            await _run_generation(
+                bot=message.bot,
+                chat_id=message.chat.id,
+                user_id=user_id,
+                model_id=last_request.model_id,
+                prompt=final_prompt,
+                style_id=style.id,
+                photo_file_ids=last_request.photo_file_ids,
+                variants_count=last_request.variants_count,
+            )
+        finally:
+            lock.release()
+
+    @router.message(~F.text.startswith("/"), StateFilter(None))
     async def handle_user_message(message: Message, state: FSMContext) -> None:
         user_id = message.from_user.id if message.from_user else 0
         snapshot = _snapshot_message(message)
-        await _safe_delete(message.bot, message.chat.id, message.message_id)
 
         if message.media_group_id:
             group_key = f"{message.chat.id}:{message.media_group_id}"
@@ -504,7 +1314,10 @@ async def _setup_commands(bot: Bot) -> None:
     await bot.set_my_commands(
         [
             BotCommand(command="start", description="Старт и выбор модели"),
+            BotCommand(command="clear", description="Очистить историю диалога"),
             BotCommand(command="swap", description="Сменить модель"),
+            BotCommand(command="count", description="Количество вариантов (1-4)"),
+            BotCommand(command="style", description="Стиль генерации"),
         ]
     )
     with suppress(Exception):
