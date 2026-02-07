@@ -43,6 +43,8 @@ class ChatResponse:
     """Response from chat API - can contain text and/or images."""
     text: str
     images: list[bytes] = field(default_factory=list)
+    # Full inline_data dicts from API response (includes thought_signature if present)
+    image_parts: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def has_images(self) -> bool:
@@ -97,19 +99,25 @@ class ApiClient:
         text_parts = _extract_text_parts(data)
         text = "\n".join(text_parts) if text_parts else ""
         
+        # Extract full image parts (with thought_signature) for context
+        image_parts = _extract_image_parts(data)
+        
+        # Decode images for sending to user
         images: list[bytes] = []
-        image_b64_list = _extract_all_inline_images(data)
-        for image_b64 in image_b64_list:
-            try:
-                images.append(base64.b64decode(image_b64.strip()))
-            except (ValueError, TypeError):
-                continue
+        for part in image_parts:
+            inline = part.get("inline_data", {})
+            image_b64 = inline.get("data", "")
+            if image_b64:
+                try:
+                    images.append(base64.b64decode(image_b64.strip()))
+                except (ValueError, TypeError):
+                    continue
 
         if not text and not images:
             detail = _extract_error_detail(data)
             raise ApiError("API response contains no content", detail)
 
-        return ChatResponse(text=text, images=images)
+        return ChatResponse(text=text, images=images, image_parts=image_parts)
 
     async def generate_image(
         self,
@@ -243,6 +251,26 @@ def _extract_all_inline_images(payload: Any) -> list[str]:
                     queue.append(value)
         elif isinstance(current, list):
             queue.extend(current)
+    
+    return results
+
+
+def _extract_image_parts(payload: Any) -> list[dict[str, Any]]:
+    """Extract full inline_data parts from API response (including thought_signature)."""
+    results: list[dict[str, Any]] = []
+    seen_data: set[str] = set()
+    
+    candidates = payload.get("candidates", []) if isinstance(payload, dict) else []
+    for candidate in candidates:
+        parts = candidate.get("content", {}).get("parts", [])
+        for part in parts:
+            inline = part.get("inline_data") or part.get("inlineData")
+            if isinstance(inline, dict):
+                data = inline.get("data")
+                if isinstance(data, str) and data not in seen_data:
+                    seen_data.add(data)
+                    # Return the full part structure to preserve thought_signature
+                    results.append({"inline_data": inline})
     
     return results
 

@@ -30,7 +30,6 @@ from api_client import (
     ApiError,
     ChatMessage,
     ChatResponse,
-    encode_image_bytes,
     encode_image_from_path,
 )
 from config import Settings, load_settings
@@ -644,21 +643,20 @@ def create_router(
                     await bot.send_message(chat_id, chunk, parse_mode=None)
             
             # Send images if any
-            response_image_data: list[dict] = []
             for i, image_bytes in enumerate(response.images):
                 await bot.send_photo(
                     chat_id,
                     BufferedInputFile(image_bytes, filename=f"image_{i+1}.png"),
                 )
-                # Store image in context for future reference (limited to avoid huge history)
-                if len(response_image_data) < 2:  # Keep max 2 images in context
-                    response_image_data.append(encode_image_bytes(image_bytes))
             
-            # Save model response to conversation
+            # Save model response to conversation with full image_parts (includes thought_signature)
+            # Limit to 2 images to avoid huge history
+            response_image_parts = response.image_parts[:2] if response.image_parts else []
+            
             model_msg = ConversationMessage(
                 role="model",
                 text=response.text if response.text else "",
-                image_data=response_image_data,
+                image_data=response_image_parts,
             )
             await storage.add_to_conversation(user_id, model_msg, max_messages=MAX_CONVERSATION_MESSAGES)
             
